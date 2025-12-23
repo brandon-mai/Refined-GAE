@@ -16,6 +16,8 @@ from model import GCN_with_feature, DotPredictor, LightGCN, Hadamard_MLPPredicto
 import time
 import wandb
 import matplotlib.pyplot as plt
+from huggingface_hub import HfApi, upload_file
+
 
 
 def parse():
@@ -55,6 +57,10 @@ def parse():
     parser.add_argument('--linear', action='store_true', default=False)
     parser.add_argument('--clip_norm', default=1.0, type=float)
     parser.add_argument('--init', default='orthogonal', type=str)
+    parser.add_argument('--hf_token', default=None, type=str)
+    parser.add_argument('--hf_repo_id', default=None, type=str)
+    parser.add_argument('--run_name', default=None, type=str)
+
 
     args = parser.parse_args()
     return args
@@ -324,6 +330,12 @@ best_val = 0
 final_test_result = None
 best_epoch = 0
 
+if args.run_name:
+    best_model_path = f'{args.run_name}.pt'
+else:
+    best_model_path = 'model.pt'
+
+
 losses = []
 valid_list = []
 test_list = []
@@ -370,6 +382,8 @@ for epoch in range(args.epochs):
         best_val = valid_results[args.metric]
         best_epoch = epoch
         final_test_result = test_results
+        torch.save({'model': model.state_dict(), 'pred': pred.state_dict(), 'embedding': embedding.state_dict() if embedding is not None else None}, best_model_path)
+
     if epoch - best_epoch >= 200:
         break
     print(f"Epoch {epoch}, Loss: {loss:.4f}, Val Loss: {val_loss:.4f}, Train {args.metric}: {train_results[args.metric]:.4f}, Valid {args.metric}: {valid_results[args.metric]:.4f}, Test {args.metric}: {test_results[args.metric]:.4f}")
@@ -390,4 +404,24 @@ plt.legend()
 plt.grid(True)
 plt.savefig('learning_curve.png')
 wandb.log({"learning_curve": wandb.Image('learning_curve.png')})
+
+if args.hf_repo_id:
+    print(f"Uploading model to Hugging Face: {args.hf_repo_id}")
+    api = HfApi(token=args.hf_token)
+    api.create_repo(repo_id=args.hf_repo_id, exist_ok=True, repo_type="model")
+    api.upload_file(
+        path_or_fileobj=best_model_path,
+        path_in_repo=best_model_path,
+        repo_id=args.hf_repo_id,
+        repo_type="model"
+    )
+    # Also upload the learning curve
+    api.upload_file(
+        path_or_fileobj='learning_curve.png',
+        path_in_repo=f'learning_curve_{args.run_name}.png' if args.run_name else 'learning_curve.png',
+        repo_id=args.hf_repo_id,
+        repo_type="model"
+    )
+    print("Upload complete!")
+
 
