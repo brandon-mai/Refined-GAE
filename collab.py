@@ -67,7 +67,11 @@ def parse():
 
 args = parse()
 print(args)
-wandb.init(project='Refined-GAE', config=args)
+
+if args.run_name:
+    wandb.init(project='Refined-GAE', name=args.run_name, config=args)
+else:
+    wandb.init(project='Refined-GAE', config=args)
 
 torch.manual_seed(args.seed)
 torch.cuda.manual_seed_all(args.seed)
