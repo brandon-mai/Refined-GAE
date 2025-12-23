@@ -15,6 +15,8 @@ from loss import auc_loss, hinge_auc_loss, log_rank_loss
 from model import GCN_with_feature, DotPredictor, LightGCN, Hadamard_MLPPredictor, GCN_with_feature_multilayers
 import time
 import wandb
+import matplotlib.pyplot as plt
+
 
 def parse():
     
@@ -178,33 +180,58 @@ def eval(model, g, pos_train_edge, pos_valid_edge, neg_valid_edge, pred, embeddi
     with torch.no_grad():
         xemb = torch.cat((embedding.weight, g.ndata['feat']), dim=1) if embedding is not None else g.ndata['feat']
         h = model(g, xemb, g.edata['weight'])
+        
+        # Validation Positive Scores
         dataloader = DataLoader(range(pos_valid_edge.size(0)), args.batch_size)
-        pos_score = []
+        pos_valid_score = []
         for _, edge_index in enumerate(tqdm.tqdm(dataloader)):
             pos_edge = pos_valid_edge[edge_index]
             pos_pred = pred(h[pos_edge[:, 0]], h[pos_edge[:, 1]])
-            pos_score.append(pos_pred)
-        pos_score = torch.cat(pos_score, dim=0)
+            pos_valid_score.append(pos_pred)
+        pos_valid_score = torch.cat(pos_valid_score, dim=0)
+        
+        # Validation Negative Scores
         dataloader = DataLoader(range(neg_valid_edge.size(0)), args.batch_size)
-        neg_score = []
+        neg_valid_score = []
         for _, edge_index in enumerate(tqdm.tqdm(dataloader)):
             neg_edge = neg_valid_edge[edge_index]
             neg_pred = pred(h[neg_edge[:, 0]], h[neg_edge[:, 1]])
-            neg_score.append(neg_pred)
-        neg_score = torch.cat(neg_score, dim=0)
+            neg_valid_score.append(neg_pred)
+        neg_valid_score = torch.cat(neg_valid_score, dim=0)
+        
         valid_results = {}
         for k in [20, 50, 100]:
-            valid_results[f'hits@{k}'] = eval_hits(pos_score, neg_score, k)[f'hits@{k}']
-        pos_score = []
+            valid_results[f'hits@{k}'] = eval_hits(pos_valid_score, neg_valid_score, k)[f'hits@{k}']
+            
+        # Comput Validation Loss
+        pos_loss = -F.logsigmoid(pos_valid_score).mean()
+        neg_loss = -F.logsigmoid(-neg_valid_score).mean()
+        val_loss = pos_loss + neg_loss
+
+        # Train Positive Scores (Reuse neg_valid_score for ranking in Eval hits? No, eval_hits takes neg_score)
+        # Wait, eval_hits(y_pred_pos, y_pred_neg, K). 
+        # In the original code, for train_results, it reused 'neg_score' which was 'neg_valid_score'.
+        # "rank y_pred_pos[i] against y_pred_neg" -> identifying hits.
+        # Standard practice: rank train pos against *some* negatives. Originally it used valid negatives?
+        # Let's check original code:
+        # neg_score = torch.cat(neg_score, dim=0) (This was valid negatives)
+        # Then for train loop: pos_score calculated for train edges.
+        # eval_hits(pos_score (train), neg_score (valid), k)
+        # Yes, it ranks train edges against valid negatives (common approx or just what they did).
+        
+        dataloader = DataLoader(range(pos_train_edge.size(0)), args.batch_size)
+        pos_train_score = []
         for _, edge_index in enumerate(tqdm.tqdm(dataloader)):
             pos_edge = pos_train_edge[edge_index]
             pos_pred = pred(h[pos_edge[:, 0]], h[pos_edge[:, 1]])
-            pos_score.append(pos_pred)
-        pos_score = torch.cat(pos_score, dim=0)
+            pos_train_score.append(pos_pred)
+        pos_train_score = torch.cat(pos_train_score, dim=0)
+        
         train_results = {}
         for k in [20, 50, 100]:
-            train_results[f'hits@{k}'] = eval_hits(pos_score, neg_score, k)[f'hits@{k}']
-    return valid_results, train_results
+            train_results[f'hits@{k}'] = eval_hits(pos_train_score, neg_valid_score, k)[f'hits@{k}']
+            
+    return valid_results, train_results, val_loss.item()
 
 # Load the dataset
 dataset = DglLinkPropPredDataset(name=args.dataset)
@@ -315,8 +342,13 @@ for epoch in range(args.epochs):
     losses.append(loss)
     if epoch % args.interval == 0 and args.step_lr_decay:
         adjustlr(optimizer, epoch / args.epochs, args.lr)
-    valid_results, train_results = eval(model, graph, train_pos_edge, valid_pos_edge, valid_neg_edge, pred, embedding)
+    valid_results, train_results, val_loss = eval(model, graph, train_pos_edge, valid_pos_edge, valid_neg_edge, pred, embedding)
     valid_list.append(valid_results[args.metric])
+    
+    # Store validation loss
+    if 'val_losses' not in locals():
+        val_losses = []
+    val_losses.append(val_loss)
     for k, v in valid_results.items():
         print(f'Validation {k}: {v:.4f}')
     for k, v in train_results.items():
@@ -340,9 +372,22 @@ for epoch in range(args.epochs):
         final_test_result = test_results
     if epoch - best_epoch >= 200:
         break
-    print(f"Epoch {epoch}, Loss: {loss:.4f}, Train {args.metric}: {train_results[args.metric]:.4f}, Valid {args.metric}: {valid_results[args.metric]:.4f}, Test {args.metric}: {test_results[args.metric]:.4f}")
-    wandb.log({'loss': loss, 'train_hit': train_results[args.metric], 'valid_hit': valid_results[args.metric], 'test_hit': test_results[args.metric]})
+    print(f"Epoch {epoch}, Loss: {loss:.4f}, Val Loss: {val_loss:.4f}, Train {args.metric}: {train_results[args.metric]:.4f}, Valid {args.metric}: {valid_results[args.metric]:.4f}, Test {args.metric}: {test_results[args.metric]:.4f}")
+    wandb.log({'loss': loss, 'val_loss': val_loss, 'train_hit': train_results[args.metric], 'valid_hit': valid_results[args.metric], 'test_hit': test_results[args.metric]})
 
 print(f'total time: {tot_time:.4f}')
 print(f"Test hit: {final_test_result[args.metric]:.4f}")
 wandb.log({'final_test_hit': final_test_result[args.metric]})
+
+# Plot Train vs Val Loss
+plt.figure(figsize=(10, 6))
+plt.plot(losses, label='Train Loss')
+plt.plot(val_losses, label='Validation Loss')
+plt.xlabel('Epoch')
+plt.ylabel('Loss')
+plt.title('Learning Curve')
+plt.legend()
+plt.grid(True)
+plt.savefig('learning_curve.png')
+wandb.log({"learning_curve": wandb.Image('learning_curve.png')})
+

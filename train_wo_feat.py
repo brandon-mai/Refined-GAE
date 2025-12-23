@@ -14,6 +14,8 @@ import argparse
 from loss import auc_loss, hinge_auc_loss, log_rank_loss
 from model import Hadamard_MLPPredictor, GCN, GCN_v1, DotPredictor, LorentzPredictor
 import wandb
+import matplotlib.pyplot as plt
+
 
 def eval_hits(y_pred_pos, y_pred_neg, K):
     '''
@@ -173,33 +175,46 @@ def eval(model, g, pos_train_edge, pos_valid_edge, neg_valid_edge, pred):
 
     with torch.no_grad():
         h = model(g, g.ndata['feat'])
+        
+        # Validation Positive Scores
         dataloader = DataLoader(range(pos_valid_edge.size(0)), args.batch_size)
-        pos_score = []
+        pos_valid_score = []
         for _, edge_index in enumerate(tqdm.tqdm(dataloader)):
             pos_edge = pos_valid_edge[edge_index]
             pos_pred = pred(h[pos_edge[:, 0]], h[pos_edge[:, 1]])
-            pos_score.append(pos_pred)
-        pos_score = torch.cat(pos_score, dim=0)
+            pos_valid_score.append(pos_pred)
+        pos_valid_score = torch.cat(pos_valid_score, dim=0)
+        
+        # Validation Negative Scores
         dataloader = DataLoader(range(neg_valid_edge.size(0)), args.batch_size)
-        neg_score = []
+        neg_valid_score = []
         for _, edge_index in enumerate(tqdm.tqdm(dataloader)):
             neg_edge = neg_valid_edge[edge_index]
             neg_pred = pred(h[neg_edge[:, 0]], h[neg_edge[:, 1]])
-            neg_score.append(neg_pred)
-        neg_score = torch.cat(neg_score, dim=0)
+            neg_valid_score.append(neg_pred)
+        neg_valid_score = torch.cat(neg_valid_score, dim=0)
+        
         valid_results = {}
         for k in [20, 50, 100]:
-            valid_results[f'hits@{k}'] = eval_hits(pos_score, neg_score, k)[f'hits@{k}']
-        pos_score = []
+            valid_results[f'hits@{k}'] = eval_hits(pos_valid_score, neg_valid_score, k)[f'hits@{k}']
+            
+        # Compute Validation Loss
+        val_loss = F.binary_cross_entropy_with_logits(pos_valid_score, torch.ones_like(pos_valid_score)) + F.binary_cross_entropy_with_logits(neg_valid_score, torch.zeros_like(neg_valid_score))
+        
+        # Train Positive Scores
+        dataloader = DataLoader(range(pos_train_edge.size(0)), args.batch_size)
+        pos_train_score = []
         for _, edge_index in enumerate(tqdm.tqdm(dataloader)):
             pos_edge = pos_train_edge[edge_index]
             pos_pred = pred(h[pos_edge[:, 0]], h[pos_edge[:, 1]])
-            pos_score.append(pos_pred)
-        pos_score = torch.cat(pos_score, dim=0)
+            pos_train_score.append(pos_pred)
+        pos_train_score = torch.cat(pos_train_score, dim=0)
+        
         train_results = {}
         for k in [20, 50, 100]:
-            train_results[f'hits@{k}'] = eval_hits(pos_score, neg_score, k)[f'hits@{k}']
-    return valid_results, train_results
+            train_results[f'hits@{k}'] = eval_hits(pos_train_score, neg_valid_score, k)[f'hits@{k}']
+            
+    return valid_results, train_results, val_loss.item()
 
 def plot_dot_product_dist(x):
     dot_products = x @ x.t()
@@ -275,7 +290,13 @@ for epoch in range(args.epochs):
     losses.append(loss)
     if epoch % args.interval == 0 and args.step_lr_decay:
         adjustlr(optimizer, epoch / args.epochs, args.lr)
-    valid_results, train_results = eval(model, graph, train_pos_edge, valid_pos_edge, valid_neg_edge, pred)
+    valid_results, train_results, val_loss = eval(model, graph, train_pos_edge, valid_pos_edge, valid_neg_edge, pred)
+    valid_list.append(valid_results[args.metric])
+    
+    # Store validation loss
+    if 'val_losses' not in locals():
+        val_losses = []
+    val_losses.append(val_loss)
     valid_list.append(valid_results[args.metric])
     for k, v in valid_results.items():
         print(f'Validation {k}: {v:.4f}')
@@ -310,9 +331,22 @@ for epoch in range(args.epochs):
             best_epoch = epoch
             final_test_result = test_results
 
-    print(f"Epoch {epoch}, Loss: {loss:.4f}, Train hit: {train_results[args.metric]:.4f}, Valid hit: {valid_results[args.metric]:.4f}, Test hit: {test_results[args.metric]:.4f}")
-    wandb.log({'loss': loss, 'train_hit': train_results[args.metric], 'valid_hit': valid_results[args.metric], 'test_hit': test_results[args.metric]})
+    print(f"Epoch {epoch}, Loss: {loss:.4f}, Val Loss: {val_loss:.4f}, Train hit: {train_results[args.metric]:.4f}, Valid hit: {valid_results[args.metric]:.4f}, Test hit: {test_results[args.metric]:.4f}")
+    wandb.log({'loss': loss, 'val_loss': val_loss, 'train_hit': train_results[args.metric], 'valid_hit': valid_results[args.metric], 'test_hit': test_results[args.metric]})
 
 # plot_dot_product_dist(graph.ndata['feat'])
 print(f"Test hit: {final_test_result[args.metric]:.4f}")
 wandb.log({'final_test_hit': final_test_result[args.metric]})
+
+# Plot Train vs Val Loss
+plt.figure(figsize=(10, 6))
+plt.plot(losses, label='Train Loss')
+plt.plot(val_losses, label='Validation Loss')
+plt.xlabel('Epoch')
+plt.ylabel('Loss')
+plt.title('Learning Curve')
+plt.legend()
+plt.grid(True)
+plt.savefig('learning_curve.png')
+wandb.log({"learning_curve": wandb.Image('learning_curve.png')})
+
