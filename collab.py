@@ -214,20 +214,16 @@ def eval(model, g, pos_train_edge, pos_valid_edge, neg_valid_edge, pred, embeddi
             valid_results[f'hits@{k}'] = eval_hits(pos_valid_score, neg_valid_score, k)[f'hits@{k}']
             
         # Comput Validation Loss
-        pos_loss = -F.logsigmoid(pos_valid_score).mean()
-        neg_loss = -F.logsigmoid(-neg_valid_score).mean()
-        val_loss = pos_loss + neg_loss
-
-        # Train Positive Scores (Reuse neg_valid_score for ranking in Eval hits? No, eval_hits takes neg_score)
-        # Wait, eval_hits(y_pred_pos, y_pred_neg, K). 
-        # In the original code, for train_results, it reused 'neg_score' which was 'neg_valid_score'.
-        # "rank y_pred_pos[i] against y_pred_neg" -> identifying hits.
-        # Standard practice: rank train pos against *some* negatives. Originally it used valid negatives?
-        # Let's check original code:
-        # neg_score = torch.cat(neg_score, dim=0) (This was valid negatives)
-        # Then for train loop: pos_score calculated for train edges.
-        # eval_hits(pos_score (train), neg_score (valid), k)
-        # Yes, it ranks train edges against valid negatives (common approx or just what they did).
+        if args.loss == 'auc':
+            val_loss = auc_loss(pos_valid_score, neg_valid_score, args.num_neg)
+        elif args.loss == 'hauc':
+            val_loss = hinge_auc_loss(pos_valid_score, neg_valid_score, args.num_neg)
+        elif args.loss == 'rank':
+            val_loss = log_rank_loss(pos_valid_score, neg_valid_score, args.num_neg)
+        else:
+            pos_loss = -F.logsigmoid(pos_valid_score).mean()
+            neg_loss = -F.logsigmoid(-neg_valid_score).mean()
+            val_loss = pos_loss + neg_loss
         
         dataloader = DataLoader(range(pos_train_edge.size(0)), args.batch_size)
         pos_train_score = []

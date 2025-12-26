@@ -208,7 +208,16 @@ def eval(model, g, pos_train_edge, pos_valid_edge, neg_valid_edge, pred):
             valid_results[f'hits@{k}'] = eval_hits(pos_valid_score, neg_valid_score, k)[f'hits@{k}']
             
         # Compute Validation Loss
-        val_loss = F.binary_cross_entropy_with_logits(pos_valid_score, torch.ones_like(pos_valid_score)) + F.binary_cross_entropy_with_logits(neg_valid_score, torch.zeros_like(neg_valid_score))
+        if args.loss == 'auc':
+            val_loss = auc_loss(pos_valid_score, neg_valid_score, args.num_neg)
+        elif args.loss == 'hauc':
+            val_loss = hinge_auc_loss(pos_valid_score, neg_valid_score, args.num_neg)
+        elif args.loss == 'rank':
+            val_loss = log_rank_loss(pos_valid_score, neg_valid_score, args.num_neg)
+        else:
+            val_loss = F.binary_cross_entropy_with_logits(pos_valid_score, torch.ones_like(pos_valid_score)) + F.binary_cross_entropy_with_logits(neg_valid_score, torch.zeros_like(neg_valid_score))
+        if args.force_orthogonal:
+            val_loss += 1e-8 * torch.norm(h @ h.t() - torch.diag(torch.diag(h @ h.t())), p='fro')
         
         # Train Positive Scores
         dataloader = DataLoader(range(pos_train_edge.size(0)), args.batch_size)
