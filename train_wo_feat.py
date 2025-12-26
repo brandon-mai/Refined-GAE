@@ -191,20 +191,48 @@ def test(model, g, pos_test_edge, neg_test_edge, pred):
 def eval(model, g, pos_train_edge, pos_valid_edge, neg_valid_edge, pred):
     model.eval()
     pred.eval()
+    
+    # Negative sampler for validation loss calculation (mimicking train)
+    neg_sampler = GlobalUniform(args.num_neg)
 
     with torch.no_grad():
         h = model(g, g.ndata['feat'])
         
-        # Validation Positive Scores
+        # Validation Positive Scores & Loss Calculation
         dataloader = DataLoader(range(pos_valid_edge.size(0)), args.batch_size)
         pos_valid_score = []
+        total_val_loss = 0
+        
         for _, edge_index in enumerate(tqdm.tqdm(dataloader)):
             pos_edge = pos_valid_edge[edge_index]
             pos_pred = pred(h[pos_edge[:, 0]], h[pos_edge[:, 1]])
             pos_valid_score.append(pos_pred)
+            
+            # Validation Loss Calculation (mimicking train loop)
+            # Sample negatives for this batch of positives
+            neg_valid_edge_loss = neg_sampler(g, pos_edge.t()[0])
+            neg_valid_edge_loss = torch.stack(neg_valid_edge_loss, dim=0).t()
+            
+            neg_pred_loss = pred(h[neg_valid_edge_loss[:, 0]], h[neg_valid_edge_loss[:, 1]])
+            
+            if args.loss == 'auc':
+                loss = auc_loss(pos_pred, neg_pred_loss, args.num_neg)
+            elif args.loss == 'hauc':
+                loss = hinge_auc_loss(pos_pred, neg_pred_loss, args.num_neg)
+            elif args.loss == 'rank':
+                loss = log_rank_loss(pos_pred, neg_pred_loss, args.num_neg)
+            else:
+                loss = F.binary_cross_entropy_with_logits(pos_pred, torch.ones_like(pos_pred)) + F.binary_cross_entropy_with_logits(neg_pred_loss, torch.zeros_like(neg_pred_loss))
+            
+            if args.force_orthogonal:
+                 loss += 1e-8 * torch.norm(h @ h.t() - torch.diag(torch.diag(h @ h.t())), p='fro')
+
+            total_val_loss += loss.item()
+
         pos_valid_score = torch.cat(pos_valid_score, dim=0)
+        val_loss = total_val_loss / len(dataloader)
         
-        # Validation Negative Scores
+        # Validation Negative Scores (for Metrics)
         dataloader = DataLoader(range(neg_valid_edge.size(0)), args.batch_size)
         neg_valid_score = []
         for _, edge_index in enumerate(tqdm.tqdm(dataloader)):
@@ -217,18 +245,6 @@ def eval(model, g, pos_train_edge, pos_valid_edge, neg_valid_edge, pred):
         for k in [20, 50, 100]:
             valid_results[f'hits@{k}'] = eval_hits(pos_valid_score, neg_valid_score, k)[f'hits@{k}']
             
-        # Compute Validation Loss
-        if args.loss == 'auc':
-            val_loss = auc_loss(pos_valid_score, neg_valid_score, args.num_neg)
-        elif args.loss == 'hauc':
-            val_loss = hinge_auc_loss(pos_valid_score, neg_valid_score, args.num_neg)
-        elif args.loss == 'rank':
-            val_loss = log_rank_loss(pos_valid_score, neg_valid_score, args.num_neg)
-        else:
-            val_loss = F.binary_cross_entropy_with_logits(pos_valid_score, torch.ones_like(pos_valid_score)) + F.binary_cross_entropy_with_logits(neg_valid_score, torch.zeros_like(neg_valid_score))
-        if args.force_orthogonal:
-            val_loss += 1e-8 * torch.norm(h @ h.t() - torch.diag(torch.diag(h @ h.t())), p='fro')
-        
         # Train Positive Scores
         dataloader = DataLoader(range(pos_train_edge.size(0)), args.batch_size)
         pos_train_score = []
@@ -242,7 +258,7 @@ def eval(model, g, pos_train_edge, pos_valid_edge, neg_valid_edge, pred):
         for k in [20, 50, 100]:
             train_results[f'hits@{k}'] = eval_hits(pos_train_score, neg_valid_score, k)[f'hits@{k}']
             
-    return valid_results, train_results, val_loss.item()
+    return valid_results, train_results, val_loss
 
 def plot_dot_product_dist(x):
     dot_products = x @ x.t()

@@ -196,21 +196,48 @@ def test(model, g, pos_test_edge, neg_test_edge, pred, embedding=None):
 def eval(model, g, pos_train_edge, pos_valid_edge, neg_valid_edge, pred, embedding=None):
     model.eval()
     pred.eval()
+    
+    # Negative sampler for validation loss calculation (mimicking train)
+    neg_sampler = GlobalUniform(args.num_neg)
 
     with torch.no_grad():
         xemb = torch.cat((embedding.weight, g.ndata['feat']), dim=1) if embedding is not None else g.ndata['feat']
         h = model(g, xemb, g.edata['weight'])
         
-        # Validation Positive Scores
+        # Validation Positive Scores & Loss Calculation
         dataloader = DataLoader(range(pos_valid_edge.size(0)), args.batch_size)
         pos_valid_score = []
+        total_val_loss = 0
+        
         for _, edge_index in enumerate(tqdm.tqdm(dataloader)):
             pos_edge = pos_valid_edge[edge_index]
             pos_pred = pred(h[pos_edge[:, 0]], h[pos_edge[:, 1]])
             pos_valid_score.append(pos_pred)
+            
+            # Validation Loss Calculation (mimicking train loop)
+            # Sample negatives for this batch of positives
+            neg_valid_edge_loss = neg_sampler(g, pos_edge.t()[0])
+            neg_valid_edge_loss = torch.stack(neg_valid_edge_loss, dim=0).t()
+            
+            neg_pred_loss = pred(h[neg_valid_edge_loss[:, 0]], h[neg_valid_edge_loss[:, 1]])
+            
+            if args.loss == 'auc':
+                loss = auc_loss(pos_pred, neg_pred_loss, args.num_neg)
+            elif args.loss == 'hauc':
+                loss = hinge_auc_loss(pos_pred, neg_pred_loss, args.num_neg)
+            elif args.loss == 'rank':
+                loss = log_rank_loss(pos_pred, neg_pred_loss, args.num_neg)
+            else:
+                pos_loss = -F.logsigmoid(pos_pred).mean()
+                neg_loss = -F.logsigmoid(-neg_pred_loss).mean()
+                loss = pos_loss + neg_loss
+            
+            total_val_loss += loss.item()
+
         pos_valid_score = torch.cat(pos_valid_score, dim=0)
+        val_loss = total_val_loss / len(dataloader)
         
-        # Validation Negative Scores
+        # Validation Negative Scores (for Metrics)
         dataloader = DataLoader(range(neg_valid_edge.size(0)), args.batch_size)
         neg_valid_score = []
         for _, edge_index in enumerate(tqdm.tqdm(dataloader)):
@@ -222,18 +249,6 @@ def eval(model, g, pos_train_edge, pos_valid_edge, neg_valid_edge, pred, embeddi
         valid_results = {}
         for k in [20, 50, 100]:
             valid_results[f'hits@{k}'] = eval_hits(pos_valid_score, neg_valid_score, k)[f'hits@{k}']
-            
-        # Comput Validation Loss
-        if args.loss == 'auc':
-            val_loss = auc_loss(pos_valid_score, neg_valid_score, args.num_neg)
-        elif args.loss == 'hauc':
-            val_loss = hinge_auc_loss(pos_valid_score, neg_valid_score, args.num_neg)
-        elif args.loss == 'rank':
-            val_loss = log_rank_loss(pos_valid_score, neg_valid_score, args.num_neg)
-        else:
-            pos_loss = -F.logsigmoid(pos_valid_score).mean()
-            neg_loss = -F.logsigmoid(-neg_valid_score).mean()
-            val_loss = pos_loss + neg_loss
         
         dataloader = DataLoader(range(pos_train_edge.size(0)), args.batch_size)
         pos_train_score = []
@@ -247,7 +262,7 @@ def eval(model, g, pos_train_edge, pos_valid_edge, neg_valid_edge, pred, embeddi
         for k in [20, 50, 100]:
             train_results[f'hits@{k}'] = eval_hits(pos_train_score, neg_valid_score, k)[f'hits@{k}']
             
-    return valid_results, train_results, val_loss.item()
+    return valid_results, train_results, val_loss
 
 # Load the dataset
 dataset = DglLinkPropPredDataset(name=args.dataset)
