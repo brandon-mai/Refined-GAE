@@ -96,7 +96,7 @@ def drop_edge(g, dpe = 0.2):
     return g
 
 class MLP(nn.Module):
-    def __init__(self, in_channels, hidden_channels, out_channels, num_layers=2, dropout=0.2,
+    def __init__(self, in_channels, hidden_channels, num_layers=2, dropout=0.2,
                  norm=False, tailact=False, norm_affine=True):
         super(MLP, self).__init__()
         self.lins = torch.nn.Sequential()
@@ -113,6 +113,7 @@ class MLP(nn.Module):
             self.lins.append(nn.ReLU())
             if dropout > 0:
                 self.lins.append(nn.Dropout(dropout))
+        out_channels = hidden_channels
         self.lins.append(torch.nn.Linear(hidden_channels, out_channels))
         if tailact:
             self.lins.append(nn.LayerNorm(out_channels), elementwise_affine=norm_affine)
