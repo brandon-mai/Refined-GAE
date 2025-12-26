@@ -242,7 +242,7 @@ class GCN_multilayers(nn.Module):
         return h
     
 class GCN_with_feature(nn.Module):
-    def __init__(self, in_feats, h_feats, norm=False, dp4norm=0, prop_step=2, dropout = 0.2, residual = 0, relu = False, linear=False, conv='GCN'):
+    def __init__(self, in_feats, h_feats, norm=False, dp4norm=0, prop_step=2, dropout = 0.2, residual = 0, concat_skip=False, relu = False, linear=False, conv='GCN'):
         super(GCN_with_feature, self).__init__()
         self.conv = conv
         if conv == 'GCN':
@@ -273,6 +273,9 @@ class GCN_with_feature(nn.Module):
             self.mlps = nn.ModuleList([MLP(in_feats, h_feats, 2, dropout)])
             for _ in range(prop_step - 1):
                 self.mlps.append(MLP(h_feats, h_feats, 2, dropout))
+        self.concat_skip = concat_skip
+        if concat_skip:
+            self.post_concat = nn.ModuleList([nn.Linear(h_feats * 2, h_feats) for _ in range(prop_step)])
 
     def _apply_norm_and_activation(self, x, i):
         if self.norm:
@@ -290,7 +293,13 @@ class GCN_with_feature(nn.Module):
             h = self._apply_norm_and_activation(h, i)
             if self.linear:
                 h = self.mlps[i](h)
-            h = self.conv2(g, h, edge_weight=e_feat).flatten(1) + self.residual * ori
+
+            h = self.conv2(g, h, edge_weight=e_feat).flatten(1)
+            
+            if self.concat_skip:
+                h = self.post_concat[i](torch.cat((h, ori), dim=1))
+            else:
+                h = h + self.residual * ori
         return h
 
 class GCN_with_feature_multilayers(nn.Module):

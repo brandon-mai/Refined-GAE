@@ -310,7 +310,7 @@ elif args.init == 'orthogonal':
 graph.ndata['feat'] = embedding.weight
 
 if args.model == 'GCN':
-    model = GCN(graph.ndata['feat'].shape[1], args.hidden, args.norm, args.dp4norm, args.drop_edge, args.relu, args.linear, args.prop_step, args.dropout, args.residual, args.conv).to(device)
+    model = GCN(graph.ndata['feat'].shape[1], args.hidden, args.norm, args.dp4norm, args.drop_edge, args.relu, args.linear, args.prop_step, args.dropout, args.residual, args.concat_skip, args.conv).to(device)
 elif args.model == 'GCN_v1':
     model = GCN_v1(graph.ndata['feat'].shape[1], args.hidden, args.norm, args.relu, args.prop_step, args.dropout, args.multilayer, args.conv, args.res, args.gin_aggr).to(device)
 else:

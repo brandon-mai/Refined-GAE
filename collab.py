@@ -336,7 +336,7 @@ else:
 input_dim = graph.ndata['feat'].shape[1] + args.emb_hidden if embedding is not None else graph.ndata['feat'].shape[1]
 
 if args.model == 'GCN':
-    model = GCN_with_feature(input_dim, args.hidden, args.norm, args.dropout, args.prop_step, args.dropout, args.residual, args.relu, args.linear, args.conv).to(device)
+    model = GCN_with_feature(input_dim, args.hidden, args.norm, args.dropout, args.prop_step, args.dropout, args.residual, args.concat_skip, args.relu, args.linear, args.conv).to(device)
 elif args.model == 'LightGCN':
     model = LightGCN(input_dim, args.hidden, args.prop_step, args.dropout, args.alpha, args.exp, args.relu).to(device)
 elif args.model == 'GCN_multilayer':
