@@ -17,7 +17,7 @@ import time
 import wandb
 import matplotlib.pyplot as plt
 from huggingface_hub import HfApi, upload_file
-
+import numpy as np
 
 
 def parse():
