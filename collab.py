@@ -178,7 +178,7 @@ def train(model, g, train_pos_edge, optimizer, neg_sampler, pred, scaler, embedd
         scaler.step(optimizer)
         scaler.update()
         total_loss += loss.item()
-        print(f"Sample time: {sample_time:.4f}", flush=True)
+        # print(f"Sample time: {sample_time:.4f}", flush=True)
 
     return total_loss / len(dataloader)
 
