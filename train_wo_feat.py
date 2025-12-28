@@ -11,7 +11,7 @@ from dgl.dataloading.negative_sampler import GlobalUniform
 from torch.utils.data import DataLoader
 import tqdm
 import argparse
-from loss import auc_loss, hinge_auc_loss, log_rank_loss
+from loss import auc_loss, hinge_auc_loss, log_rank_loss, pull_loss
 from model import Hadamard_MLPPredictor, GCN, GCN_v1, DotPredictor, LorentzPredictor
 import wandb
 import matplotlib.pyplot as plt
@@ -52,7 +52,7 @@ def parse():
     parser.add_argument("--epochs", default=50, type=int, help="Number of training epochs (used in Main Script -> Training Loop)")
     parser.add_argument("--batch_size", default=8192, type=int, help="Batch size for training and evaluation (used in Main Script -> DataLoader)")
     parser.add_argument("--metric", default='hits@20', type=str, help="Evaluation metric (used in Main Script -> Evaluation)")
-    parser.add_argument("--loss", default='bce', choices=['bce', 'auc', 'hauc', 'rank'], type=str, help="Loss function type (used in Main Script -> Loss Calculation)")
+    parser.add_argument("--loss", default='bce', choices=['bce', 'auc', 'hauc', 'rank', 'pull'], type=str, help="Loss function type (used in Main Script -> Loss Calculation)")
     parser.add_argument("--interval", default=100, type=int, help="Interval for learning rate decay (used in Main Script -> Training Loop)")
     parser.add_argument("--step_lr_decay", action='store_true', default=True, help="Whether to use step learning rate decay (used in Main Script -> Learning Rate Scheduler)")
     parser.add_argument('--clip_norm', default=1.0, type=float, help="Gradient clipping norm (used in Main Script -> Training Loop)")
@@ -60,6 +60,8 @@ def parse():
     # Data / Sampling
     parser.add_argument("--num_neg", default=1, type=int, help="Number of negative samples per positive sample (used in Main Script -> Data Loading / Negative Sampling)")
     parser.add_argument("--maskinput", action='store_true', default=False, help="Whether to mask input edges during training (used in Main Script -> Data Preprocessing)")
+    parser.add_argument("--pull_interval", default=200, type=int, help="Interval for PULL expected graph update (used in train loop)")
+    parser.add_argument("--pull_r", default=0.05, type=float, help="Growth rate for PULL K (used in train loop)")
 
     # Encoder (GCN / Embedding)
     parser.add_argument("--model", default='GCN', choices=['GCN', 'GCN_with_feature', 'GCN_with_MLP', 'GCN_v1', 'LightGCN', 'LightGCN_res', 'MultiheadLightGCN'], type=str, help="Model architecture (used in Main Script -> Model Instantiation)")
@@ -111,7 +113,7 @@ def adjustlr(optimizer, decay_ratio, lr):
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr_
 
-def train(model, g, train_pos_edge, optimizer, neg_sampler, pred):
+def train(model, g, train_pos_edge, optimizer, neg_sampler, pred, pseudo_pos_dict=None):
     model.train()
     pred.train()
 
@@ -147,6 +149,17 @@ def train(model, g, train_pos_edge, optimizer, neg_sampler, pred):
             loss = hinge_auc_loss(pos_score, neg_score, args.num_neg)
         elif args.loss == 'rank':
             loss = log_rank_loss(pos_score, neg_score, args.num_neg)
+        elif args.loss == 'pull':
+            neg_targets = torch.zeros_like(neg_score)
+            if pseudo_pos_dict is not None:
+                neg_edge_cpu = neg_edge.cpu()
+                for i in range(neg_edge.size(0)):
+                    u, v = int(neg_edge_cpu[i, 0]), int(neg_edge_cpu[i, 1])
+                    if u > v: u, v = v, u # normalize for undirected lookup if we stored them sorted
+                    if (u, v) in pseudo_pos_dict:
+                        neg_targets[i] = pseudo_pos_dict[(u, v)]
+            
+            loss = pull_loss(pos_score, neg_score, neg_targets)
         else:
             loss = F.binary_cross_entropy_with_logits(pos_score, torch.ones_like(pos_score)) + F.binary_cross_entropy_with_logits(neg_score, torch.zeros_like(neg_score))
         if args.force_orthogonal:
@@ -221,8 +234,10 @@ def eval(model, g, pos_train_edge, pos_valid_edge, neg_valid_edge, pred):
                 loss = hinge_auc_loss(pos_pred, neg_pred_loss, args.num_neg)
             elif args.loss == 'rank':
                 loss = log_rank_loss(pos_pred, neg_pred_loss, args.num_neg)
-            else:
-                loss = F.binary_cross_entropy_with_logits(pos_pred, torch.ones_like(pos_pred)) + F.binary_cross_entropy_with_logits(neg_pred_loss, torch.zeros_like(neg_pred_loss))
+            else: # pull loss not typically used for validation metrics directly
+                pos_loss = -F.logsigmoid(pos_pred).mean()
+                neg_loss = -F.logsigmoid(-neg_pred_loss).mean()
+                loss = pos_loss + neg_loss
             
             if args.force_orthogonal:
                  loss += 1e-8 * torch.norm(h @ h.t() - torch.diag(torch.diag(h @ h.t())), p='fro')
@@ -319,6 +334,15 @@ else:
 parameter = itertools.chain(model.parameters(), pred.parameters(), embedding.parameters())
 optimizer = torch.optim.Adam(parameter, lr=args.lr)
 
+# PULL Setup
+if args.loss == 'pull':
+    pull_K = train_pos_edge.size(0) # Initial K = |E_train|
+    # Top-100 Degree Nodes for Candidate Set
+    degs = graph.in_degrees()
+    top_deg_nodes = torch.topk(degs, 100).indices.cpu().numpy()
+    pseudo_pos_dict = {}
+    pull_updates = 0
+
 best_val = 0
 final_test_result = None
 best_epoch = 0
@@ -333,10 +357,86 @@ losses = []
 valid_list = []
 test_list = []
 
-print(f'number of parameters: {sum(p.numel() for p in model.parameters()) + sum(p.numel() for p in pred.parameters()) + sum(p.numel() for p in embedding.parameters())}')
+print(f'number of parameters: {sum(p.numel() for p in model.parameters()) + sum(p.numel() for p in pred.parameters()) + sum(embedding.parameters())}')
 
-for epoch in range(args.epochs):
-    loss = train(model, graph, train_pos_edge, optimizer, neg_sampler, pred)
+for epoch in range(1, args.epochs + 1):
+    
+    # PULL Outer Loop (Update Pseudo-Labels)
+    if args.loss == 'pull' and epoch % args.pull_interval == 0 and pull_updates < 10:
+        pull_updates += 1
+        print(f"PULL Update {pull_updates}: Generating pseudo-labels...")
+        
+        # 1. Update K
+        pull_K = int(pull_K + args.pull_r * train_pos_edge.size(0))
+        
+        # 2. Generate Candidate Negatives
+        # Candidates: Edges where at least one node is in top_deg_nodes
+        # We sample random negatives and filter.
+        # Efficient Sampling: 5 * K candidates
+        num_candidates = 5 * pull_K 
+        
+        # We need a custom sampling strategy or just reuse neg_sampler?
+        # neg_sampler generates negatives for specific positive edges (pos_edge.t()[0])
+        # We want global negatives involving top nodes.
+        
+        # Crude approach: Uniform sample large batch, then filter.
+        model.eval()
+        with torch.no_grad():
+            h = model(graph, graph.ndata['feat'])
+            
+            # Simple candidate generation:
+            # Pair top nodes with random nodes.
+            # top_deg_nodes (100) x Random (N)
+            # We want ~5*K candidates.
+            
+            # Sampling: 
+            # src = random.choice(top_deg_nodes)
+            # dst = random.choice(all_nodes)
+            
+            candidates_src = np.random.choice(top_deg_nodes, num_candidates)
+            candidates_dst = np.random.randint(0, graph.num_nodes(), num_candidates)
+            
+            # Filter valid (not in graph) - Assume simplified check or rely on massive sparsity
+            # For exactness, check has_edges_between
+            cand_edges = (torch.tensor(candidates_src).to(device), torch.tensor(candidates_dst).to(device))
+            
+            # Check existence
+            # dgl has_edges_between matches src, dst elementwise
+            exists = graph.has_edges_between(cand_edges[0], cand_edges[1])
+            # also undirected check? (v, u)
+            exists_rev = graph.has_edges_between(cand_edges[1], cand_edges[0])
+            valid_mask = ~(exists | exists_rev)
+            
+            valid_src = candidates_src[valid_mask.cpu().numpy()]
+            valid_dst = candidates_dst[valid_mask.cpu().numpy()]
+            
+            if len(valid_src) == 0:
+                print("Warning: No valid candidates found for PULL.")
+                pseudo_pos_dict = {}
+            else:
+                # Predict Scores
+                # Batch prediction
+                cand_h_src = h[valid_src]
+                cand_h_dst = h[valid_dst]
+                cand_scores = pred(cand_h_src, cand_h_dst).sigmoid().cpu().numpy() # Use sigmoid for probability
+                
+                # Take Top-K
+                k_actual = min(len(cand_scores), pull_K)
+                top_indices = np.argpartition(cand_scores, -k_actual)[-k_actual:]
+                
+                pseudo_pos_dict = {}
+                for idx in top_indices:
+                    u, v = int(valid_src[idx]), int(valid_dst[idx])
+                    score = float(cand_scores[idx])
+                    if u > v: u, v = v, u # Normalize
+                    pseudo_pos_dict[(u, v)] = score
+                
+                print(f"PULL Update: Selected {len(pseudo_pos_dict)} pseudo-positives (Target K={pull_K})")
+
+    if args.loss == 'pull':
+        loss = train(model, graph, train_pos_edge, optimizer, neg_sampler, pred, pseudo_pos_dict)
+    else:
+        loss = train(model, graph, train_pos_edge, optimizer, neg_sampler, pred)
     losses.append(loss)
     if epoch % args.interval == 0 and args.step_lr_decay:
         adjustlr(optimizer, epoch / args.epochs, args.lr)
