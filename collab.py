@@ -111,7 +111,7 @@ def adjustlr(optimizer, decay_ratio, lr):
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr_
 
-def train(model, g, train_pos_edge, optimizer, neg_sampler, pred, embedding=None, pseudo_pos_dict=None):
+def train(model, g, train_pos_edge, optimizer, neg_sampler, pred, scaler, embedding=None, pseudo_pos_dict=None):
     model.train()
     pred.train()
 
@@ -122,59 +122,61 @@ def train(model, g, train_pos_edge, optimizer, neg_sampler, pred, embedding=None
     sample_time = 0
     for _, edge_index in enumerate(tqdm.tqdm(dataloader)):
         xemb = torch.cat((embedding.weight, g.ndata['feat']), dim=1) if embedding is not None else g.ndata['feat']
-        if args.maskinput:
-            mask[edge_index] = 0
-            tei = train_pos_edge[mask]
-            tei = tei.unique(dim=0)
-            src, dst = tei.t()
-            re_tei = torch.stack((dst, src), dim=0).t()
-            tei = torch.cat((tei, re_tei), dim=0)
-            g_mask = dgl.graph((tei[:, 0], tei[:, 1]), num_nodes=g.num_nodes())
-            g_mask = dgl.add_self_loop(g_mask)
-            edge_weight = torch.ones(g_mask.number_of_edges(), dtype=torch.float32).to(device)
-            h = model(g_mask, xemb, edge_weight)
-            mask[edge_index] = 1
-        else:
-            h = model(g, xemb, g.edata['weight'])
+        # Use AMP
+        with torch.cuda.amp.autocast(enabled=True):
+            if args.maskinput:
+                mask[edge_index] = 0
+                tei = train_pos_edge[mask]
+                tei = tei.unique(dim=0)
+                src, dst = tei.t()
+                re_tei = torch.stack((dst, src), dim=0).t()
+                tei = torch.cat((tei, re_tei), dim=0)
+                g_mask = dgl.graph((tei[:, 0], tei[:, 1]), num_nodes=g.num_nodes())
+                g_mask = dgl.add_self_loop(g_mask)
+                edge_weight = torch.ones(g_mask.number_of_edges(), dtype=torch.float32).to(device)
+                h = model(g_mask, xemb, edge_weight)
+                mask[edge_index] = 1
+            else:
+                h = model(g, xemb, g.edata['weight'])
 
-        pos_edge = train_pos_edge[edge_index]
-        st = time.time()
-        neg_train_edge = neg_sampler(g, pos_edge.t()[0])
-        sample_time += time.time() - st
-        neg_train_edge = torch.stack(neg_train_edge, dim=0)
-        neg_train_edge = neg_train_edge.t()
-        neg_edge = neg_train_edge
-        pos_score = pred(h[pos_edge[:, 0]], h[pos_edge[:, 1]])
-        neg_score = pred(h[neg_edge[:, 0]], h[neg_edge[:, 1]])
-        if args.loss == 'auc':
-            loss = auc_loss(pos_score, neg_score, args.num_neg)
-        elif args.loss == 'hauc':
-            loss = hinge_auc_loss(pos_score, neg_score, args.num_neg)
-        elif args.loss == 'rank':
-            loss = log_rank_loss(pos_score, neg_score, args.num_neg)
-        elif args.loss == 'pull':
-            neg_targets = torch.zeros_like(neg_score)
-            if pseudo_pos_dict is not None:
-                neg_edge_cpu = neg_edge.cpu()
-                for i in range(neg_edge.size(0)):
-                    u, v = int(neg_edge_cpu[i, 0]), int(neg_edge_cpu[i, 1])
-                    if u > v: u, v = v, u 
-                    if (u, v) in pseudo_pos_dict:
-                        neg_targets[i] = pseudo_pos_dict[(u, v)]
-            loss = pull_loss(pos_score, neg_score, neg_targets)
-        else:
+            pos_edge = train_pos_edge[edge_index]
+            neg_train_edge = neg_sampler(g, pos_edge.t()[0])
+            neg_train_edge = torch.stack(neg_train_edge, dim=0)
+            neg_train_edge = neg_train_edge.t()
+            neg_edge = neg_train_edge
+            pos_score = pred(h[pos_edge[:, 0]], h[pos_edge[:, 1]])
+            neg_score = pred(h[neg_edge[:, 0]], h[neg_edge[:, 1]])
+            if args.loss == 'auc':
+                loss = auc_loss(pos_score, neg_score, args.num_neg)
+            elif args.loss == 'hauc':
+                loss = hinge_auc_loss(pos_score, neg_score, args.num_neg)
+            elif args.loss == 'rank':
+                loss = log_rank_loss(pos_score, neg_score, args.num_neg)
+            elif args.loss == 'pull':
+                neg_targets = torch.zeros_like(neg_score)
+                if pseudo_pos_dict is not None:
+                    neg_edge_cpu = neg_edge.cpu()
+                    for i in range(neg_edge.size(0)):
+                        u, v = int(neg_edge_cpu[i, 0]), int(neg_edge_cpu[i, 1])
+                        if u > v: u, v = v, u 
+                        if (u, v) in pseudo_pos_dict:
+                            neg_targets[i] = pseudo_pos_dict[(u, v)]
+                loss = pull_loss(pos_score, neg_score, neg_targets)
+            else:
             # pos_loss = -F.logsigmoid(pos_score).mean()
             # neg_loss = -F.logsigmoid(-neg_score).mean()
             # loss = pos_loss + neg_loss
-            loss = F.binary_cross_entropy_with_logits(pos_score, torch.ones_like(pos_score)) + F.binary_cross_entropy_with_logits(neg_score, torch.zeros_like(neg_score)).mean()
+                loss = F.binary_cross_entropy_with_logits(pos_score, torch.ones_like(pos_score)) + F.binary_cross_entropy_with_logits(neg_score, torch.zeros_like(neg_score)).mean()
         
         optimizer.zero_grad()
-        loss.backward()
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer) # Unscale gradients before clipping
         torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_norm)
         torch.nn.utils.clip_grad_norm_(pred.parameters(), args.clip_norm)
         if embedding is not None:
             torch.nn.utils.clip_grad_norm_(embedding.parameters(), args.clip_norm)
-        optimizer.step()
+        scaler.step(optimizer)
+        scaler.update()
         total_loss += loss.item()
         print(f"Sample time: {sample_time:.4f}", flush=True)
 
@@ -362,6 +364,7 @@ parameter = itertools.chain(model.parameters(), pred.parameters())
 if embedding is not None:
     parameter = itertools.chain(parameter, embedding.parameters())
 optimizer = torch.optim.Adam(parameter, lr=args.lr)
+scaler = torch.cuda.amp.GradScaler()
 
 # PULL Setup
 if args.loss == 'pull':
@@ -423,9 +426,19 @@ for epoch in range(1, args.epochs + 1):
                 print("Warning: No valid candidates found for PULL.")
                 pseudo_pos_dict = {}
             else:
-                cand_h_src = h[valid_src]
-                cand_h_dst = h[valid_dst]
-                cand_scores = pred(cand_h_src, cand_h_dst).sigmoid().cpu().numpy()
+                # Batched prediction to avoid OOM
+                cand_scores_list = []
+                batch_size_pull = 10000 
+                with torch.cuda.amp.autocast(enabled=True):
+                    for i in range(0, len(valid_src), batch_size_pull):
+                        batch_src = valid_src[i:i+batch_size_pull]
+                        batch_dst = valid_dst[i:i+batch_size_pull]
+                        batch_h_src = h[batch_src]
+                        batch_h_dst = h[batch_dst]
+                        batch_scores = pred(batch_h_src, batch_h_dst).sigmoid().flatten()
+                        cand_scores_list.append(batch_scores)
+                
+                cand_scores = torch.cat(cand_scores_list).cpu().numpy()
                 
                 k_actual = min(len(cand_scores), pull_K)
                 top_indices = np.argpartition(cand_scores, -k_actual)[-k_actual:]
@@ -441,9 +454,9 @@ for epoch in range(1, args.epochs + 1):
 
     st = time.time()
     if args.loss == 'pull':
-        loss = train(model, graph, train_pos_edge, optimizer, neg_sampler, pred, embedding, pseudo_pos_dict)
+        loss = train(model, graph, train_pos_edge, optimizer, neg_sampler, pred, scaler, embedding, pseudo_pos_dict)
     else:
-        loss = train(model, graph, train_pos_edge, optimizer, neg_sampler, pred, embedding)
+        loss = train(model, graph, train_pos_edge, optimizer, neg_sampler, pred, scaler, embedding)
     print(f"Epoch {epoch}, Time: {time.time()-st:.4f}", flush=True)
     tot_time += time.time() - st
     losses.append(loss)
